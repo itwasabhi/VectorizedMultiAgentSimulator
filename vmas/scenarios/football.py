@@ -111,6 +111,12 @@ class Scenario(BaseScenario):
         self.observe_adversaries = kwargs.pop("observe_adversaries", True)
         self.dict_obs = kwargs.pop("dict_obs", False)
 
+        # Match / Termination config
+        self.terminate_on_goal = kwargs.pop("terminate_on_goal", True)
+        self.observe_is_kickoff = kwargs.pop(
+            "observe_is_kickoff", not self.terminate_on_goal
+        )
+
         if kwargs.pop("dense_reward_ratio", None) is not None:
             raise ValueError(
                 "dense_reward_ratio in football is deprecated, please use `dense_reward` "
@@ -141,6 +147,11 @@ class Scenario(BaseScenario):
             batch_dim, device=device, dtype=torch.float32
         )
         self._sparse_reward_red = self._sparse_reward_blue.clone()
+        self.blue_goals = torch.zeros(batch_dim, device=device, dtype=torch.int32)
+        self.red_goals = torch.zeros(batch_dim, device=device, dtype=torch.int32)
+        self.blue_score = torch.zeros(batch_dim, device=device, dtype=torch.bool)
+        self.red_score = torch.zeros(batch_dim, device=device, dtype=torch.bool)
+        self.is_kickoff = torch.ones((batch_dim, 1), device=device, dtype=torch.float32)
         self._render_field = True
         self.min_agent_dist_to_ball_blue = None
         self.min_agent_dist_to_ball_red = None
@@ -167,8 +178,68 @@ class Scenario(BaseScenario):
         self.reset_controllers(env_index)
         if env_index is None:
             self._done[:] = False
+            self.blue_goals[:] = 0
+            self.red_goals[:] = 0
+            self.blue_score[:] = False
+            self.red_score[:] = False
+            self.is_kickoff[:] = 1.0
         else:
             self._done[env_index] = False
+            self.blue_goals[env_index] = 0
+            self.red_goals[env_index] = 0
+            self.blue_score[env_index] = False
+            self.red_score[env_index] = False
+            self.is_kickoff[env_index] = 1.0
+
+    def soft_reset(self, env_index: int = None):
+        # Reset ball state
+        zero_pos = torch.zeros(2, device=self.world.device, dtype=torch.float32)
+        zero_vel = torch.zeros(2, device=self.world.device, dtype=torch.float32)
+        self.ball.set_pos(zero_pos, batch_index=env_index)
+        self.ball.set_vel(zero_vel, batch_index=env_index)
+        if env_index is None:
+            self.ball.state.force[:] = 0.0
+            if self.enable_shooting:
+                self.ball.kicking_action[:] = 0.0
+        else:
+            self.ball.state.force[env_index] = 0.0
+            if self.enable_shooting:
+                self.ball.kicking_action[env_index] = 0.0
+
+        # Reset agents state and spawn positions
+        self.reset_agents(env_index)
+        for agent in self.blue_agents + self.red_agents:
+            agent.set_vel(zero_vel, batch_index=env_index)
+            agent.set_ang_vel(
+                torch.zeros(1, device=self.world.device, dtype=torch.float32),
+                batch_index=env_index,
+            )
+            if env_index is None:
+                agent.state.force[:] = 0.0
+                agent.state.torque[:] = 0.0
+                agent.action._reset(None)
+                agent.ball_within_angle[:] = False
+                agent.ball_within_range[:] = False
+                agent.shoot_force[:] = 0.0
+            else:
+                agent.state.force[env_index] = 0.0
+                agent.state.torque[env_index] = 0.0
+                agent.action._reset(env_index)
+                agent.ball_within_angle[env_index] = False
+                agent.ball_within_range[env_index] = False
+                agent.shoot_force[env_index] = 0.0
+
+        # Reset distance shaping baselines
+        self.reset_ball(env_index)
+
+        # Reset controllers
+        self.reset_controllers(env_index)
+
+        # Set kickoff indicator
+        if env_index is None:
+            self.is_kickoff[:] = 1.0
+        else:
+            self.is_kickoff[env_index] = 1.0
 
     def init_world(self, batch_dim: int, device: torch.device):
         # Make world
@@ -1111,6 +1182,9 @@ class Scenario(BaseScenario):
             agent.action.u = agent.action.u[:, :-1]
 
     def pre_step(self):
+        self.is_kickoff[:] = 0.0
+        self.blue_score[:] = False
+        self.red_score[:] = False
         if self.enable_shooting:
             self._agents_rel_pos_to_ball = (
                 None  # Make sure the global elements in precess_actions are recomputed
@@ -1133,12 +1207,28 @@ class Scenario(BaseScenario):
             )
             blue_score = over_right_line * goal_mask
             red_score = over_left_line * goal_mask
+            self.blue_score = blue_score
+            self.red_score = red_score
+            self.blue_goals += blue_score.to(torch.int32)
+            self.red_goals += red_score.to(torch.int32)
+
             self._sparse_reward_blue = (
                 self.scoring_reward * blue_score - self.scoring_reward * red_score
             )
             self._sparse_reward_red = -self._sparse_reward_blue
 
-            self._done = blue_score | red_score
+            if self.terminate_on_goal:
+                self._done = blue_score | red_score
+            else:
+                self._done[:] = False
+                goal_scored = blue_score | red_score
+                if goal_scored.any():
+                    goal_envs = torch.nonzero(goal_scored).squeeze(-1)
+                    if goal_envs.dim() == 0:
+                        goal_envs = goal_envs.unsqueeze(0)
+                    for env_idx in goal_envs:
+                        self.soft_reset(env_idx.item())
+
             # Dense Reward
             self._dense_reward_blue = 0
             self._dense_reward_red = 0
@@ -1298,6 +1388,7 @@ class Scenario(BaseScenario):
             if teammate_vels is None
             else teammate_vels,
             blue=blue,
+            is_kickoff=self.is_kickoff[env_index],
         )
         return obs
 
@@ -1318,6 +1409,7 @@ class Scenario(BaseScenario):
         ball_force,
         goal_pos,
         blue: bool,
+        is_kickoff=None,
     ):
         # Make all inputs same batch size (this is needed when this function is called for rendering
         input = [
@@ -1336,6 +1428,12 @@ class Scenario(BaseScenario):
             adversary_forces,
             adversary_vels,
         ]
+        if self.observe_is_kickoff:
+            if is_kickoff is None:
+                is_kickoff = torch.zeros(
+                    (1, 1), device=self.world.device, dtype=torch.float32
+                )
+            input.append(is_kickoff)
         for o in input:
             if isinstance(o, Tensor) and len(o.shape) > 1:
                 batch_dim = o.shape[0]
@@ -1353,22 +1451,41 @@ class Scenario(BaseScenario):
                         o[i] = o[i].unsqueeze(0).expand(batch_dim, *o[i].shape)
                     o[i] = o[i].clone()
 
-        (
-            agent_pos,
-            agent_rot,
-            agent_vel,
-            agent_force,
-            ball_pos,
-            ball_vel,
-            ball_force,
-            goal_pos,
-            teammate_poses,
-            teammate_forces,
-            teammate_vels,
-            adversary_poses,
-            adversary_forces,
-            adversary_vels,
-        ) = input
+        if self.observe_is_kickoff:
+            (
+                agent_pos,
+                agent_rot,
+                agent_vel,
+                agent_force,
+                ball_pos,
+                ball_vel,
+                ball_force,
+                goal_pos,
+                teammate_poses,
+                teammate_forces,
+                teammate_vels,
+                adversary_poses,
+                adversary_forces,
+                adversary_vels,
+                is_kickoff,
+            ) = input
+        else:
+            (
+                agent_pos,
+                agent_rot,
+                agent_vel,
+                agent_force,
+                ball_pos,
+                ball_vel,
+                ball_force,
+                goal_pos,
+                teammate_poses,
+                teammate_forces,
+                teammate_vels,
+                adversary_poses,
+                adversary_forces,
+                adversary_vels,
+            ) = input
         #  End rendering code
 
         if (
@@ -1452,6 +1569,9 @@ class Scenario(BaseScenario):
                 else torch.cat(obs["teammates"], dim=-1)
             ]
 
+        if self.observe_is_kickoff:
+            obs["is_kickoff"] = [is_kickoff]
+
         for key, value in obs.items():
             obs[key] = torch.cat(value, dim=-1)
         if self.dict_obs:
@@ -1498,6 +1618,11 @@ class Scenario(BaseScenario):
                 self.ball.pos_shaping_blue if blue else self.ball.pos_shaping_red
             )
             / self.pos_shaping_factor_ball_goal,
+            "is_kickoff": self.is_kickoff.clone(),
+            "blue_goals": self.blue_goals.clone(),
+            "red_goals": self.red_goals.clone(),
+            "blue_score": self.blue_score.clone(),
+            "red_score": self.red_score.clone(),
         }
         if blue and self.min_agent_dist_to_ball_blue is not None:
             info["min_agent_dist_to_ball"] = self.min_agent_dist_to_ball_blue
